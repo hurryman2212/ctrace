@@ -1,0 +1,19 @@
+# Only refresh the host loader cache for libraries installed in its standard
+# directories. Staged and custom-prefix installs must not affect the host.
+if(NOT "$ENV{DESTDIR}" STREQUAL "")
+  return()
+endif()
+foreach(installed_file IN LISTS CMAKE_INSTALL_MANIFEST_FILES)
+  if(installed_file MATCHES
+     "^/usr(/local)?/lib(64|/[^/]+-linux-gnu)?/libctrace\\.so$")
+    find_program(
+      ldconfig
+      NAMES ldconfig
+      PATHS /sbin /usr/sbin REQUIRED)
+    execute_process(COMMAND "${ldconfig}" RESULT_VARIABLE result)
+    if(NOT result EQUAL 0)
+      message(FATAL_ERROR "ldconfig failed: ${result}")
+    endif()
+    break()
+  endif()
+endforeach()

@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: MIT
+obj-m += kctrace.o
+kctrace-y := core.o probe.o
+ccflags-y += -I$(src)/../include/uapi -I$(src)/../include

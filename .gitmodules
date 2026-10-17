@@ -1,0 +1,3 @@
+[submodule "dynamorio"]
+	path = dynamorio
+	url = git@github.com:hurryman2212/dynamorio.git

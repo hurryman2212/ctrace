@@ -1,0 +1,3 @@
+#!/bin/sh
+drrun_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+exec "$drrun_dir/@CTRACE_DRRUN_RELATIVE@" "$@"
