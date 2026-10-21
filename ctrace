@@ -1,0 +1,1068 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Run the CMake-built C/C++ tracer."""
+
+import argparse, fcntl, os, platform, pwd, re, shutil, socket, stat, struct, subprocess, sys
+
+from pathlib import Path
+
+# CMake embeds generate-version.sh output in the installed launcher.
+VERSION = None
+
+
+def program_version():
+    if VERSION is not None:
+        return VERSION
+    try:
+        return (
+            subprocess.run(
+                ["sh", str(Path(__file__).resolve().with_name("generate-version.sh"))],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).stdout.strip()
+            or "unknown"
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+class TraceError(Exception):
+    pass
+
+
+class HelpFormatter(argparse.RawDescriptionHelpFormatter):
+    def _format_text(self, text):
+        if "%(version)s" in text:
+            text = text.replace("%(version)s", program_version())
+        return super()._format_text(text)
+
+    def _split_lines(self, text, width):
+        lines = []
+        for paragraph in text.splitlines():
+            lines.extend(super()._split_lines(paragraph, width))
+        return lines
+
+
+def install_prefixes(value):
+    paths = value.split(",")
+    if any(not path or any(c in path for c in "\r\n\0") for path in paths):
+        raise argparse.ArgumentTypeError("--install-prefix requires PATH,...")
+    return [Path(path).expanduser().resolve() for path in paths]
+
+
+def cache_directory(value=None):
+    if value == "":
+        return ""
+    if value is not None:
+        if any(c in value for c in "\r\n\0"):
+            raise argparse.ArgumentTypeError(
+                "--cache-dir requires a valid PATH or an empty string"
+            )
+        return str(Path(value).expanduser().resolve())
+    directory = os.environ.get("XDG_CACHE_HOME")
+    if directory and Path(directory).is_absolute():
+        return str((Path(directory) / "ctrace").resolve())
+    return str((Path.home() / ".cache/ctrace").resolve())
+
+
+def source_map(value):
+    mappings = {}
+    for pair in value.split(","):
+        old, separator, new = pair.partition("=")
+        new = os.path.expanduser(new)
+        if not separator or not old.startswith("/") or not new.startswith("/"):
+            raise argparse.ArgumentTypeError(
+                "--src-map requires absolute OLD=NEW prefixes"
+            )
+        old, new = os.path.normpath(old), os.path.normpath(new)
+        if old in mappings or any(c in pair for c in "\r\n\0"):
+            raise argparse.ArgumentTypeError("invalid or duplicate --src-map prefix")
+        mappings[old] = new
+    return ",".join(f"{old}={new}" for old, new in mappings.items())
+
+
+def argument_parser():
+    parser = argparse.ArgumentParser(
+        prog="ctrace",
+        add_help=False,
+        allow_abbrev=False,
+        formatter_class=HelpFormatter,
+        usage=(
+            "%(prog)s [--cache-dir PATH] [--decompile] [-f] "
+            "[-h] [--init-instrument {arm,perfetto,full}] [--install-prefix PATH,...] "
+            "[--kernel-buffer-bundles N] "
+            "[--kernel-sign-key FILE --kernel-sign-cert FILE] [--kernel-sign-hash HASH] "
+            "[--no-info] [--no-warning] [--no-style] [-o FILE] [--perfetto] "
+            "[--perfetto-only] [--skip-src-checksum] [--timeout-instrument MS] "
+            "[--src-map OLD=NEW,...] "
+            "[--x86-syntax {att,intel}] "
+            "[--recurse-step-into PATTERN,...] "
+            "[--step-into PATTERN,...] [--step-over PATTERN,...] "
+            "[--within PATTERN,...] [--within-init] [--within-intr] "
+            "[--within-new-stack] [--version] PROG [ARGS]"
+        ),
+        description=(
+            "%(prog)s %(version)s\n\n"
+            "Trace C/C++ execution or a kernel module and observed before/after values."
+        ),
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=cache_directory,
+        default=None,
+        metavar="PATH",
+        help=(
+            'Disk cache root; "" disables all disk caches (default: '
+            "XDG_CACHE_HOME/ctrace, then ~/.cache/ctrace)"
+        ),
+    )
+    parser.add_argument(
+        "--decompile",
+        action="store_true",
+        help=(
+            "Use Ghidra to reconstruct statements when verified source is unavailable "
+            "(see --install-prefix for engine discovery)"
+        ),
+    )
+    parser.add_argument(
+        "-f",
+        "--follow-forks",
+        action="store_true",
+        help=(
+            "Follow newly created child threads and processes; exec from a traced "
+            "thread is always followed, with or without -f"
+        ),
+    )
+    parser.add_argument(
+        "-h", "--help", action="help", help="Show this help message and exit"
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version="%(prog)s %(version)s",
+        help="Show the program version and exit",
+    )
+    parser.add_argument(
+        "--init-instrument",
+        choices=("arm", "perfetto", "full"),
+        default="full",
+        help="Initial instrumentation level (default: full)",
+    )
+    parser.add_argument(
+        "--install-prefix",
+        type=install_prefixes,
+        metavar="PATH,...",
+        help=(
+            "Search prefixes in order: each root, then bin and lib for missing files "
+            "(default: undefined; search this ctrace's directory, its parent "
+            "directory's lib, then system paths).\n"
+            "For --decompile: search each Ghidra root, share/ghidra, and "
+            "lib/ctrace/ghidra beneath these prefixes (when undefined: default "
+            "runtime directories, GHIDRA_INSTALL_DIR, GHIDRA_HOME, then "
+            "analyzeHeadless on PATH)"
+        ),
+    )
+    parser.add_argument(
+        "--timeout-instrument",
+        type=int,
+        default=50,
+        metavar="MS",
+        help=(
+            "Userspace shared instrumentation wait before using DR, in milliseconds "
+            "(default: 50; 0: do not wait; -1: wait without a time limit)"
+        ),
+    )
+    parser.add_argument(
+        "--no-info", action="store_true", help="Suppress ctrace informational logs"
+    )
+    parser.add_argument(
+        "--no-warning",
+        action="store_true",
+        help="Suppress ctrace warnings; keep errors",
+    )
+    parser.add_argument(
+        "--no-style",
+        action="store_true",
+        help="Disable all colored, bold, and background styling",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        metavar="FILE",
+        help="Write all ctrace logs to FILE; target stdout/stderr stay unchanged",
+    )
+    parser.add_argument(
+        "--perfetto",
+        action="store_true",
+        help=(
+            "Write Perfetto function/block events selected by within selectors "
+            "and step filters. Step-over calls hide body events.\n"
+            "Syscalls are recorded while --within is active or in signal handlers, "
+            "regardless of step filters. Signal events and the [PROGRAM] execution "
+            "bar remain visible regardless of filters.\n"
+            "Output: PROGRAM.HOSTNAME.USERNAME.YYYYMMDD-HHMMSS.TID.json in the current "
+            "working directory (shared wall-clock timeline across threads and processes; "
+            "slice costs separately exclude tracing callbacks and terminal output). "
+            "The filename uses local time when the logger creates the file and the "
+            "initial traced thread's TID"
+        ),
+    )
+    parser.add_argument(
+        "--perfetto-only",
+        action="store_true",
+        help="Suppress ctrace trace logs; keep info and warnings (requires --perfetto)",
+    )
+    parser.add_argument(
+        "--skip-src-checksum",
+        action="store_true",
+        help="Use readable source without checksum validation (warnings remain)",
+    )
+    parser.add_argument(
+        "--src-map",
+        type=source_map,
+        metavar="OLD=NEW,...",
+        help="Map absolute DWARF source directory prefixes to local directories",
+    )
+    parser.add_argument(
+        "--x86-syntax",
+        choices=("att", "intel"),
+        help=(
+            "Assembly display syntax (default: undefined; preserve source asm, "
+            "show generated asm as AT&T)"
+        ),
+    )
+    filters = parser.add_argument_group(
+        "filters",
+        description=(
+            "Function patterns use ltrace FILTER EXPRESSIONS. Within selectors are ORed;\n"
+            "a matching within selector permits tracing, subject to the step filters.\n"
+            "Interrupted frames remain active across nested signal/IRQ handlers.\n"
+            "Without within selectors, the call stack does not restrict tracing.\n"
+            "Leaving the scope disables detailed instrumentation.\n"
+            "Without step filters, all in-scope bodies are traced, including unnamed code.\n"
+            "Unnamed code can match wildcard/module patterns or inherit recursive tracing.\n"
+            "For kernel modules, step-into and recursive tracing cover only PROG;\n"
+            "vmlinux and other module bodies are not traced.\n"
+            "Overlapping explicit matches use this priority, regardless of option order:\n"
+            "  --recurse-step-into > --step-into > --step-over\n"
+            "Step-over hides inherited recursion but shows call inputs and results."
+        ),
+    )
+    filters.add_argument(
+        "--recurse-step-into",
+        action="append",
+        metavar="PATTERN,...",
+        help="Enter matching functions and their descendants (userspace: across libraries)",
+    )
+    filters.add_argument(
+        "--step-into",
+        action="append",
+        metavar="PATTERN,...",
+        help="Enter matching function bodies",
+    )
+    filters.add_argument(
+        "--step-over",
+        action="append",
+        metavar="PATTERN,...",
+        help="Show matching call inputs and results without entering their bodies",
+    )
+    filters.add_argument(
+        "--within",
+        action="append",
+        metavar="PATTERN,...",
+        help="Select scope while this thread's active call stack contains a match",
+    )
+    filters.add_argument(
+        "--within-init",
+        action="store_true",
+        help="Select the executable entry point's or module init function's active call scope",
+    )
+    filters.add_argument(
+        "--within-intr",
+        action="store_true",
+        help="Select scope while an actual signal/IRQ handler frame is active",
+    )
+    filters.add_argument(
+        "--within-new-stack",
+        action="store_true",
+        help="Select scope for child processes/threads started on a new stack",
+    )
+    parser.add_argument(
+        "program", metavar="PROG", help="Target ELF executable or kernel module"
+    )
+    parser.add_argument(
+        "program_args",
+        nargs=argparse.REMAINDER,
+        metavar="ARGS",
+        help="Executable arguments or kernel module name=value parameters",
+    )
+    buffering = parser.add_argument_group(
+        "kernel event buffering",
+        description=(
+            "Kernel probes reuse per-CPU ring buffers allocated before tracing.\n"
+            "This avoids allocating and freeing memory for each event and supports\n"
+            "IRQ/atomic contexts where allocations must not sleep.\n"
+            "If collection falls behind, full buffers drop complete observations.\n"
+            "Larger burst reserves absorb more pending data at the cost of more RAM."
+        ),
+    )
+    buffering.add_argument(
+        "--kernel-buffer-bundles",
+        type=int,
+        metavar="N",
+        help=(
+            "Extra large-capture burst capacity per CPU, added to the ordinary "
+            "kernel event queue (default: 64; increase if events are dropped)"
+        ),
+    )
+    kernel = parser.add_argument_group(
+        "kernel module signing",
+        description=(
+            "Instrumentation changes module bytes, invalidating any original signature.\n"
+            "Without a key and certificate, load the transformed module unsigned."
+        ),
+    )
+    kernel.add_argument(
+        "--kernel-sign-key",
+        type=Path,
+        metavar="FILE",
+        help="Re-sign transformed signed input with this private key (requires --kernel-sign-cert)",
+    )
+    kernel.add_argument(
+        "--kernel-sign-cert",
+        type=Path,
+        metavar="FILE",
+        help="Signing certificate (requires --kernel-sign-key)",
+    )
+    kernel.add_argument(
+        "--kernel-sign-hash",
+        metavar="HASH",
+        help=(
+            "Optional hash override (requires signing key). Otherwise try compatible "
+            "hashes in order: original module, kernel default, sha256, remaining hashes"
+        ),
+    )
+    return parser
+
+
+def arguments(argv, parser=None):
+    if parser is None:
+        parser = argument_parser()
+    args = parser.parse_args(argv)
+    if args.perfetto_only and not args.perfetto:
+        parser.error("--perfetto-only requires --perfetto")
+    if not -1 <= args.timeout_instrument <= 2147483647:
+        parser.error("--timeout-instrument must be -1 or 0..2147483647 milliseconds")
+    if args.kernel_buffer_bundles is not None and not (
+        1 <= args.kernel_buffer_bundles <= 4294967295
+    ):
+        parser.error("--kernel-buffer-bundles must be 1..4294967295")
+    if bool(args.kernel_sign_key) != bool(args.kernel_sign_cert):
+        parser.error("--kernel-sign-key and --kernel-sign-cert are required together")
+    if args.kernel_sign_hash is not None:
+        if not args.kernel_sign_key:
+            parser.error("--kernel-sign-hash requires --kernel-sign-key")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", args.kernel_sign_hash):
+            parser.error("invalid kernel signature hash name")
+    if args.cache_dir is None:
+        args.cache_dir = cache_directory()
+    args.program = [args.program, *args.program_args]
+    del args.program_args
+    return args
+
+
+def output_argument(parser, argv):
+    """Locate the log before parsing errors, without consuming target arguments."""
+    destination = None
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--" or parser._parse_optional(token) is None:
+            break
+        index += 1
+        if token.startswith("--"):
+            name, separator, value = token.partition("=")
+            options = [(name, value if separator else None)]
+        else:
+            options = []
+            for position, letter in enumerate(token[1:], 1):
+                name = "-" + letter
+                action = parser._option_string_actions.get(name)
+                if action is None:
+                    break
+                value = token[position + 1 :]
+                if action.nargs != 0:
+                    options.append((name, value.removeprefix("=") if value else None))
+                    break
+                options.append((name, None))
+        for name, value in options:
+            action = parser._option_string_actions.get(name)
+            if action is None or action.nargs == 0:
+                continue
+            if value is None and index < len(argv):
+                following = argv[index]
+                if following != "--" and parser._parse_optional(following) is None:
+                    value = following
+                    index += 1
+            if action.dest == "output" and value is not None:
+                destination = value
+    return destination
+
+
+class LogOutput:
+    """Serialize launcher records with the runtime's shared log descriptor."""
+
+    encoding = "utf-8"
+    errors = "backslashreplace"
+
+    def __init__(self, descriptor, fallback):
+        self.descriptor = descriptor
+        self.fallback = fallback
+        self.pending = ""
+        self.failed = False
+
+    def fileno(self):
+        return self.descriptor
+
+    def isatty(self):
+        return False
+
+    def write(self, text):
+        self.pending += text
+        end = self.pending.rfind("\n") + 1
+        if end:
+            record, self.pending = self.pending[:end], self.pending[end:]
+            self.emit(record)
+        return len(text)
+
+    def flush(self):
+        if self.pending:
+            record, self.pending = self.pending, ""
+            self.emit(record)
+
+    def emit(self, record):
+        if self.failed:
+            self.fallback.write(record)
+            self.fallback.flush()
+            return
+        locked = False
+        try:
+            fcntl.lockf(self.descriptor, fcntl.LOCK_EX, 1, 0)
+            locked = True
+            data = record.encode(self.encoding, self.errors)
+            while data:
+                count = os.write(self.descriptor, data)
+                if not count:
+                    raise OSError("zero-length log write")
+                data = data[count:]
+        except OSError as error:
+            self.failed = True
+            self.fallback.write(f"ctrace: cannot write output log: {error}\n")
+            self.fallback.write(record)
+            self.fallback.flush()
+        finally:
+            if locked:
+                try:
+                    fcntl.lockf(self.descriptor, fcntl.LOCK_UN, 1, 0)
+                except OSError as error:
+                    self.failed = True
+                    self.fallback.write(f"ctrace: cannot unlock output log: {error}\n")
+                    self.fallback.flush()
+
+
+def check_program(program):
+    path = Path(program if "/" in program else shutil.which(program) or program)
+    status = path.stat()
+    if not stat.S_ISREG(status.st_mode):
+        raise TraceError(f"not a regular file: {program}")
+    with path.open("rb") as stream:
+        header = stream.read(64)
+        if header.startswith((b"\x1f\x8b", b"\xfd7zXZ\x00", b"\x28\xb5\x2f\xfd")):
+            # The kernel helper decompresses and validates the complete ELF/module
+            # snapshot before preparing or loading any kernel code.
+            return "kernel", path.resolve()
+        if header.startswith(b"\x04\x22\x4d\x18"):
+            raise TraceError("compressed lz4 modules are unsupported")
+        if (
+            len(header) != 64
+            or header[:7] != b"\x7fELF\x02\x01\x01"
+            or int.from_bytes(header[18:20], "little") != 62
+            or int.from_bytes(header[20:24], "little") != 1
+            or int.from_bytes(header[52:54], "little") != 64
+        ):
+            raise TraceError(f"not a Linux x86-64 ELF executable or module: {program}")
+        kind = int.from_bytes(header[16:18], "little")
+        if kind in (2, 3):
+            if not os.access(path, os.X_OK):
+                raise TraceError(f"not an executable regular file: {program}")
+            if status.st_mode & (stat.S_ISUID | stat.S_ISGID):
+                raise TraceError("setuid/setgid executables are unsupported")
+            return "executable", path.resolve()
+        if kind != 1:
+            raise TraceError(f"unsupported ELF type {kind}: {program}")
+
+        def invalid(reason):
+            raise TraceError(f"not a valid kernel module: {program}: {reason}")
+
+        def read_region(offset, size):
+            if offset > status.st_size or size > status.st_size - offset:
+                invalid("ELF section exceeds file bounds")
+            stream.seek(offset)
+            content = stream.read(size)
+            if len(content) != size:
+                invalid("ELF changed or was truncated while reading")
+            return content
+
+        section_offset = int.from_bytes(header[40:48], "little")
+        entry_size = int.from_bytes(header[58:60], "little")
+        section_count = int.from_bytes(header[60:62], "little")
+        names_index = int.from_bytes(header[62:64], "little")
+        if (
+            section_offset < 64
+            or entry_size != 64
+            or int.from_bytes(header[56:58], "little")
+        ):
+            invalid("missing or unsupported ELF section table")
+        first = struct.unpack("<IIQQQQIIQQ", read_region(section_offset, 64))
+        if first[1] != 0:
+            invalid("invalid ELF null section")
+        if section_count == 0:
+            section_count = first[5]
+        if names_index == 0xFFFF:
+            names_index = first[6]
+        if not 0 < names_index < section_count:
+            invalid("invalid ELF section count/string-table index")
+        sections = list(
+            struct.iter_unpack(
+                "<IIQQQQIIQQ", read_region(section_offset, section_count * 64)
+            )
+        )
+        for section in sections[1:]:
+            if section[8] and section[8] & (section[8] - 1):
+                invalid("ELF section alignment is not a power of two")
+            if section[1] != 8 and (
+                section[4] > status.st_size or section[5] > status.st_size - section[4]
+            ):
+                invalid("ELF section exceeds file bounds")
+
+        def read_metadata(section):
+            return read_region(section[4], section[5])
+
+        def string_at(strings, offset):
+            if offset >= len(strings):
+                invalid("ELF string offset exceeds its string table")
+            end = strings.find(b"\0", offset)
+            if end < 0:
+                invalid("unterminated ELF string")
+            return strings[offset:end]
+
+        if sections[names_index][1] != 3:
+            invalid("section names do not reference a string table")
+        names = read_metadata(sections[names_index])
+        named = {}
+        for index, section in enumerate(sections):
+            name = string_at(names, section[0])
+            if name in (b".modinfo", b".gnu.linkonce.this_module"):
+                if name in named:
+                    invalid("duplicate kernel module metadata section")
+                named[name] = index
+        if len(named) != 2:
+            invalid("ET_REL object lacks kernel module metadata or descriptor")
+        descriptor_index = named[b".gnu.linkonce.this_module"]
+        descriptor = sections[descriptor_index]
+        information = sections[named[b".modinfo"]]
+        if (
+            descriptor[1] != 1
+            or not descriptor[5]
+            or descriptor[2] & 3 != 3
+            or information[1] != 1
+            or information[2] & 0x800
+            or not information[5]
+        ):
+            invalid("invalid kernel module metadata or descriptor section")
+        metadata = read_metadata(information)
+        if not metadata.endswith(b"\0"):
+            invalid("unterminated kernel module metadata")
+        entries = metadata.split(b"\0")
+        if not any(
+            entry.startswith(b"vermagic=") and len(entry) > 9 for entry in entries
+        ):
+            invalid("kernel module vermagic is missing")
+        if not any(entry.startswith(b"name=") and len(entry) > 5 for entry in entries):
+            invalid("kernel module name is missing")
+        found_descriptor = False
+        for section in sections:
+            if section[1] != 2:
+                continue
+            if (
+                section[9] != 24
+                or section[5] % 24
+                or not 0 < section[6] < section_count
+                or sections[section[6]][1] != 3
+            ):
+                invalid("invalid ELF symbol table")
+            strings = read_metadata(sections[section[6]])
+            symbols = read_metadata(section)
+            for symbol in struct.iter_unpack("<IBBHQQ", symbols):
+                name = string_at(strings, symbol[0])
+                if name != b"__this_module":
+                    continue
+                if (
+                    symbol[1] & 15 != 1
+                    or symbol[3] != descriptor_index
+                    or symbol[4] != 0
+                    or symbol[5] != descriptor[5]
+                ):
+                    invalid("invalid __this_module descriptor symbol")
+                found_descriptor = True
+        if not found_descriptor:
+            invalid("kernel module __this_module descriptor symbol is missing")
+        return "kernel", path.resolve()
+
+
+def find_kernel_runtime(prefixes=None):
+    location = Path(__file__).resolve().parent
+    directories = (
+        (location, location.parent / "lib")
+        if prefixes is None
+        else [
+            directory
+            for prefix in prefixes
+            for directory in (prefix, prefix / "bin", prefix / "lib")
+        ]
+    )
+    for directory in directories:
+        helper = directory / "ctrace_kernel"
+        if helper.is_file() and os.access(helper, os.X_OK):
+            return helper.resolve()
+    if prefixes is None:
+        if helper := shutil.which("ctrace_kernel"):
+            return Path(helper).resolve()
+        raise TraceError(
+            "ctrace_kernel not found in this ctrace's directory, its parent "
+            "directory's lib or PATH"
+        )
+    raise TraceError("not found in --install-prefix paths: ctrace_kernel")
+
+
+def find_client():
+    directories = os.environ.get("LD_LIBRARY_PATH")
+    if directories is not None:
+        for directory in directories.replace(";", ":").split(":"):
+            path = Path(directory) / "libctrace.so"
+            if path.is_file():
+                return path.resolve()
+    cache = subprocess.run(
+        [shutil.which("ldconfig") or "/sbin/ldconfig", "-p"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=True,
+    ).stdout
+    for line in cache.splitlines():
+        library, separator, path = line.strip().partition(" => ")
+        if library.startswith("libctrace.so (") and "x86-64" in library:
+            if separator and Path(path).is_file():
+                return Path(path).resolve()
+    raise TraceError("libctrace.so not found in LD_LIBRARY_PATH or the loader cache")
+
+
+def find_runtime(prefixes=None):
+    found = {}
+    required = ("drrun", "ctrace_analyze", "libctrace.so")
+    location = Path(__file__).resolve().parent
+    directories = (
+        (location, location.parent / "lib")
+        if prefixes is None
+        else [
+            directory
+            for prefix in prefixes
+            for directory in (prefix, prefix / "bin", prefix / "lib")
+        ]
+    )
+    for directory in directories:
+        for name in required:
+            path = directory / name
+            if name not in found and path.is_file():
+                if name == "libctrace.so" or os.access(path, os.X_OK):
+                    found[name] = path.resolve()
+        if len(found) == len(required):
+            return tuple(found[name] for name in required)
+    # Our drrun wrapper identifies the actual GNUInstallDirs library root,
+    # including relocated installs whose libdir is not named "lib".
+    if "libctrace.so" not in found and "drrun" in found:
+        runtime = find_dynamorio(found["drrun"])
+        if runtime is not None:
+            client = runtime.parent.parent.parent.parent / "libctrace.so"
+            if client.is_file():
+                found["libctrace.so"] = client.resolve()
+    if len(found) == len(required):
+        return tuple(found[name] for name in required)
+    if prefixes is None:
+        for name in required[:2]:
+            if name not in found and (executable := shutil.which(name)):
+                found[name] = Path(executable).resolve()
+        missing = ", ".join(name for name in required[:2] if name not in found)
+        if missing:
+            raise TraceError(
+                "not found in this ctrace's directory, its parent directory's "
+                f"lib or PATH: {missing}"
+            )
+        if "libctrace.so" not in found:
+            found["libctrace.so"] = find_client()
+        return tuple(found[name] for name in required)
+    missing = ", ".join(name for name in required if name not in found)
+    raise TraceError(f"not found in --install-prefix paths: {missing}")
+
+
+def find_dynamorio(runner):
+    runner = runner.resolve()
+    visited = set()
+    while runner not in visited:
+        visited.add(runner)
+        try:
+            with runner.open("rb") as stream:
+                contents = stream.read(65536)
+        except OSError:
+            return None
+        if contents.startswith(b"\x7fELF"):
+            root = runner.parent.parent
+            for configuration in ("release", "debug"):
+                library = root / "lib64" / configuration / "libdynamorio.so"
+                if library.is_file():
+                    return library.resolve()
+            return None
+        # Follow only our installed wrapper, including custom GNUInstallDirs.
+        # Arbitrary shell wrappers may choose another runtime dynamically.
+        wrapper = re.fullmatch(
+            rb"#!/bin/sh\n"
+            rb"(?:# SPDX-License-Identifier: MIT\n)?"
+            rb'drrun_dir=\$\(CDPATH=\'\' cd -- "\$\(dirname -- "\$0"\)" && pwd\)\n'
+            rb'exec "\$drrun_dir/([^"\n]+)" "\$@"\n?',
+            contents,
+        )
+        if wrapper is None:
+            return None
+        runner = (runner.parent / os.fsdecode(wrapper[1])).resolve()
+    return None
+
+
+def configure_decompiler(helper, prefixes, environment):
+    worker = helper.with_name("ctrace_decompile")
+    if not worker.is_file() or not os.access(worker, os.X_OK):
+        raise TraceError(f"decompilation backend is not installed: {worker}")
+    environment["CTRACE_DECOMPILE_WORKER"] = str(worker)
+    launcher_directory = Path(__file__).resolve().parent
+    engine_roots = (
+        prefixes
+        if prefixes is not None
+        else (
+            launcher_directory,
+            launcher_directory.parent / "lib",
+            launcher_directory.parent,
+            helper.parent,
+            helper.parent.parent,
+        )
+    )
+    headless = next(
+        (
+            candidate
+            for root in engine_roots
+            for candidate in (
+                root / "support/analyzeHeadless",
+                root / "share/ghidra/support/analyzeHeadless",
+                root / "lib/ctrace/ghidra/support/analyzeHeadless",
+            )
+            if candidate.is_file() and os.access(candidate, os.X_OK)
+        ),
+        None,
+    )
+    if headless is None and prefixes is None:
+        for name in ("GHIDRA_INSTALL_DIR", "GHIDRA_HOME"):
+            directory = os.environ.get(name)
+            if not directory:
+                continue
+            candidate = Path(directory).expanduser() / "support/analyzeHeadless"
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                headless = candidate
+                break
+    if headless is None and prefixes is None:
+        found = shutil.which("analyzeHeadless")
+        if found:
+            headless = Path(found)
+    if headless is None:
+        raise TraceError(
+            "Ghidra not found; include its installation directory in "
+            "--install-prefix. Without explicit prefixes, set GHIDRA_INSTALL_DIR "
+            "or GHIDRA_HOME, or put analyzeHeadless on PATH"
+        )
+    environment["CTRACE_GHIDRA_HOME"] = str(headless.resolve().parent.parent)
+    check = subprocess.run(
+        [str(worker), "--check"],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if check.returncode:
+        detail = check.stderr.strip() or check.stdout.strip()
+        raise TraceError(
+            "decompilation backend unavailable: "
+            + (detail or f"exit status {check.returncode}")
+        )
+
+
+def private_descriptor(descriptor):
+    """Keep an owned runtime FD without filling a closed application stdio FD."""
+    if descriptor >= 3:
+        return descriptor
+    try:
+        return fcntl.fcntl(descriptor, fcntl.F_DUPFD_CLOEXEC, 3)
+    finally:
+        os.close(descriptor)
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    parser = argument_parser()
+    output = None
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    try:
+        destination = output_argument(parser, argv)
+        if destination is not None:
+            descriptor = private_descriptor(
+                os.open(
+                    destination,
+                    os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_APPEND,
+                    0o666,
+                )
+            )
+            os.set_inheritable(descriptor, True)
+            output = LogOutput(descriptor, original_stderr)
+            sys.stdout = sys.stderr = output
+        args = arguments(argv, parser)
+        diagnostic_environment = {
+            "CTRACE_NO_INFO": "1" if args.no_info else "0",
+            "CTRACE_NO_WARNING": "1" if args.no_warning else "0",
+        }
+        if platform.system() != "Linux" or platform.machine() not in (
+            "x86_64",
+            "amd64",
+        ):
+            raise TraceError("Linux x86-64 is required")
+        target_kind, target_path = check_program(args.program[0])
+        if target_kind != "kernel" and args.kernel_sign_key:
+            raise TraceError("kernel signing options require a kernel module target")
+        if target_kind != "kernel" and args.kernel_buffer_bundles is not None:
+            raise TraceError("--kernel-buffer-bundles requires a kernel module target")
+        perfetto_prefix = None
+        if args.perfetto:
+            program_name = Path(args.program[0]).name
+            hostname = socket.gethostname().replace("/", "_")
+            username = pwd.getpwuid(os.getuid()).pw_name.replace("/", "_")
+            perfetto_prefix = str(Path.cwd() / f"{program_name}.{hostname}.{username}")
+        if target_kind == "kernel":
+            if args.follow_forks:
+                raise TraceError("-f/--follow-forks does not apply to kernel modules")
+            if args.within_new_stack:
+                raise TraceError("--within-new-stack does not apply to kernel modules")
+            for parameter in args.program[1:]:
+                if (
+                    not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*=.*", parameter)
+                    or "\r" in parameter
+                ):
+                    raise TraceError(
+                        "kernel module parameters must use name=value arguments"
+                    )
+            helper = find_kernel_runtime(args.install_prefix)
+            command = [
+                str(helper),
+                "--module",
+                str(target_path),
+                "--cache-dir",
+                args.cache_dir,
+                "--init-instrument",
+                args.init_instrument,
+            ]
+            if args.kernel_buffer_bundles is not None:
+                command += ["--kernel-buffer-bundles", str(args.kernel_buffer_bundles)]
+            if args.install_prefix is not None:
+                command += [
+                    "--install-prefix",
+                    ",".join(str(path) for path in args.install_prefix),
+                ]
+            if args.kernel_sign_key:
+                command += [
+                    "--kernel-sign-key",
+                    str(args.kernel_sign_key.resolve()),
+                    "--kernel-sign-cert",
+                    str(args.kernel_sign_cert.resolve()),
+                ]
+                if args.kernel_sign_hash is not None:
+                    command += ["--kernel-sign-hash", args.kernel_sign_hash]
+            for option, value in (
+                ("--src-map", args.src_map),
+                ("--x86-syntax", args.x86_syntax),
+            ):
+                if value is not None:
+                    command += [option, value]
+            for option, enabled in (
+                ("--within-intr", args.within_intr),
+                ("--within-init", args.within_init),
+                ("--decompile", args.decompile),
+                ("--skip-src-checksum", args.skip_src_checksum),
+                ("--perfetto", args.perfetto),
+                ("--perfetto-only", args.perfetto_only),
+                ("--no-info", args.no_info),
+                ("--no-warning", args.no_warning),
+                ("--no-style", args.no_style or output is not None),
+            ):
+                if enabled:
+                    command.append(option)
+            if output is not None:
+                command += ["--output-fd", str(output.fileno())]
+            if perfetto_prefix is not None:
+                command += [
+                    "--perfetto-prefix",
+                    perfetto_prefix,
+                    "--controller-tid",
+                    str(os.getpid()),
+                ]
+            for option, expressions in (
+                ("--within", args.within),
+                ("--step-into", args.step_into),
+                ("--recurse-step-into", args.recurse_step_into),
+                ("--step-over", args.step_over),
+            ):
+                for expression in expressions or ():
+                    command.append(option + "=" + expression)
+            command += ["--", *args.program[1:]]
+            environment = dict(os.environ)
+            environment.update(diagnostic_environment)
+            environment["CTRACE_CACHE_DIR"] = args.cache_dir
+            if args.decompile:
+                configure_decompiler(helper, args.install_prefix, environment)
+            os.execve(command[0], command, environment)
+        runner, helper, client = find_runtime(args.install_prefix)
+        helper_environment = dict(os.environ)
+        helper_environment.update(diagnostic_environment)
+        helper_environment.pop("CTRACE_OUTPUT_FD", None)
+        helper_environment.pop("CTRACE_PERFETTO_ONLY", None)
+        if output is not None:
+            helper_environment["CTRACE_OUTPUT_FD"] = str(output.fileno())
+        helper_environment["CTRACE_CACHE_DIR"] = args.cache_dir
+        helper_environment["CTRACE_CLIENT_PATH"] = str(client.resolve())
+        dynamorio = find_dynamorio(runner)
+        helper_environment["CTRACE_DYNAMORIO_PATH"] = (
+            str(dynamorio) if dynamorio is not None else ""
+        )
+        if args.decompile:
+            configure_decompiler(helper, args.install_prefix, helper_environment)
+        command = [
+            str(Path(runner).resolve()),
+            "-quiet",
+            # Shared DR basic blocks keep immutable bodies and private bindings.
+            # DR's separate multi-block trace builder cannot yet consume them.
+            "-disable_traces",
+            # Initial preparation publishes verified contiguous block spans.
+            "-max_elide_jmp",
+            "0",
+            "-max_elide_call",
+            "0",
+            "-stack_size",
+            "128K",
+            "-c",
+            str(client),
+        ]
+        if args.src_map is not None:
+            command += ["--src-map", args.src_map]
+        if args.skip_src_checksum:
+            command += ["--skip-src-checksum"]
+        if args.decompile:
+            command += ["--decompile"]
+        if args.follow_forks:
+            command += ["--follow-forks"]
+        if args.within_intr:
+            command += ["--within-intr"]
+        if args.within_init:
+            command += ["--within-init"]
+        if args.within_new_stack:
+            command += ["--within-new-stack"]
+        if output is not None:
+            command += ["--output-fd", str(output.fileno())]
+        if args.no_style or output is not None:
+            command += ["--no-style"]
+        if args.perfetto:
+            command += ["--perfetto"]
+        if args.perfetto_only:
+            command += ["--perfetto-only"]
+        if args.no_info:
+            command += ["--no-info"]
+        if args.no_warning:
+            command += ["--no-warning"]
+        command += ["--timeout-instrument", str(args.timeout_instrument)]
+        command += ["--init-instrument", args.init_instrument]
+        if args.x86_syntax is not None:
+            command += ["--x86-syntax", args.x86_syntax]
+        for option, filters in (
+            ("--within", args.within),
+            ("--step-into", args.step_into),
+            ("--recurse-step-into", args.recurse_step_into),
+            ("--step-over", args.step_over),
+        ):
+            for expression in filters or ():
+                command += [option, expression]
+        parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        try:
+            if parent.fileno() < 3:
+                parent = socket.socket(fileno=private_descriptor(parent.detach()))
+            if child.fileno() < 3:
+                child = socket.socket(fileno=private_descriptor(child.detach()))
+        except OSError:
+            parent.close()
+            child.close()
+            raise
+        with parent, child:
+            result = subprocess.run(
+                [
+                    str(helper),
+                    "--broker-detach",
+                    str(child.fileno()),
+                    *(
+                        # The initial thread's TID equals its PID across exec.
+                        [perfetto_prefix, str(os.getpid())]
+                        if perfetto_prefix is not None
+                        else []
+                    ),
+                ],
+                pass_fds=(child.fileno(),)
+                + ((output.fileno(),) if output is not None else ()),
+                env=helper_environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=output.fileno() if output is not None else None,
+            )
+            if result.returncode:
+                raise TraceError("analysis helper failed to start")
+            child.close()
+            parent.set_inheritable(True)
+            command += ["--analysis-fd", str(parent.fileno()), "--", *args.program]
+            os.execve(command[0], command, helper_environment)
+    except (TraceError, OSError, ValueError, subprocess.CalledProcessError) as error:
+        print(f"ctrace: {error}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        if output is not None:
+            output.flush()
+            sys.stdout, sys.stderr = original_stdout, original_stderr
+            os.close(output.fileno())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

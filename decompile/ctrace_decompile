@@ -1,0 +1,1146 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Persistent, optional Ghidra backend for ctrace's analysis helper."""
+
+import argparse, atexit, collections, ctypes, fcntl, gzip, hashlib, json, os, platform, select, shutil, signal, socket, subprocess, sys, tempfile, zlib
+
+from pathlib import Path
+
+MAX_MODULES = 2
+MAX_PREPARED_BYTES = 16 * 1024 * 1024
+MAX_PREPARED_FUNCTIONS = 256
+# Small JSON records already occupy a single filesystem block.
+COMPRESS_OBJECT_MINIMUM = 4096
+
+
+class ModuleInitializationError(RuntimeError):
+    """The engine exited unsuccessfully before this module became usable."""
+
+
+def installation():
+    explicit = next(
+        (
+            os.environ[name]
+            for name in ("CTRACE_GHIDRA_HOME", "GHIDRA_INSTALL_DIR", "GHIDRA_HOME")
+            if os.environ.get(name)
+        ),
+        None,
+    )
+    if explicit:
+        headless = Path(explicit).expanduser().resolve() / "support/analyzeHeadless"
+    else:
+        found = shutil.which("analyzeHeadless")
+        if not found:
+            raise RuntimeError(
+                "Ghidra was not found; add its prefix with --install-prefix or put analyzeHeadless on PATH"
+            )
+        headless = Path(found).resolve()
+    if not headless.is_file() or not os.access(headless, os.X_OK):
+        raise RuntimeError(f"Ghidra analyzeHeadless is not executable: {headless}")
+    properties = headless.parent.parent / "Ghidra/application.properties"
+    settings = {}
+    for line in properties.read_text().splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            settings[key.strip()] = value.strip()
+    java = Path(os.environ.get("JAVA_HOME", "")) / "bin/java"
+    if not java.is_file():
+        found = shutil.which("java")
+        if not found:
+            raise RuntimeError("Ghidra requires a Java development kit")
+        java = Path(found)
+    # Match analyzeHeadless's own JDK selection, including its configured saved
+    # JDK. A compatible java runtime alone cannot compile the exporter script.
+    selected = subprocess.run(
+        [
+            str(java),
+            "-cp",
+            str(headless.parent / "LaunchSupport.jar"),
+            "LaunchSupport",
+            str(headless.parent.parent),
+            "-jdk_home",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if (
+        selected.returncode
+        or not (Path(selected.stdout.strip()) / "bin/javac").is_file()
+    ):
+        minimum = settings.get("application.java.min", "21")
+        raise RuntimeError(
+            f"Ghidra requires JDK {minimum} or newer; set JAVA_HOME to a full JDK"
+        )
+    script = Path(__file__).resolve().with_name("CtraceDecompileServer.java")
+    if not script.is_file():
+        raise RuntimeError(
+            "CtraceDecompileServer.java was not found beside the backend"
+        )
+    return headless, script, settings.get("application.version", "unknown")
+
+
+def read_response(stream):
+    line = stream.readline()
+    if not line:
+        raise RuntimeError("Ghidra backend disconnected")
+    if not line.endswith(b"\n"):
+        raise RuntimeError("Ghidra returned an incomplete response")
+    response = json.loads(line)
+    if not isinstance(response, dict):
+        raise RuntimeError("Ghidra returned an invalid response")
+    return response
+
+
+def stop_process(process):
+    if process is None or process.poll() is not None:
+        return
+    # analyzeHeadless may leave a shell above the JVM. Retain its actual child
+    # tree before terminating so the JVM and native decompiler exit together.
+    descendants = []
+    pending = [process.pid]
+    while pending:
+        pid = pending.pop()
+        descendants.append(pid)
+        try:
+            pending.extend(
+                int(child)
+                for child in Path(f"/proc/{pid}/task/{pid}/children")
+                .read_text()
+                .split()
+            )
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+    for pid in reversed(descendants):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    process.wait()
+
+
+def project_manifest(project):
+    if not (project / "ctrace.gpr").is_file() or not (project / "ctrace.rep").is_dir():
+        raise ValueError("incomplete Ghidra project")
+    files = {}
+    for item in sorted(project.rglob("*")):
+        if item.is_symlink():
+            raise ValueError("Ghidra project cache contains a symbolic link")
+        if item.is_file():
+            digest = hashlib.sha256()
+            with item.open("rb") as source:
+                for block in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(block)
+            files[item.relative_to(project).as_posix()] = [
+                item.stat().st_size,
+                digest.hexdigest(),
+            ]
+    return files
+
+
+class Module:
+    def __init__(
+        self,
+        path,
+        headless,
+        script,
+        contract_hash,
+        project_cache=None,
+        display_path=None,
+    ):
+        self.path = path
+        self.contract_hash = contract_hash
+        self.display_path = display_path or path
+        self.project_cache = project_cache
+        self.workspace = tempfile.TemporaryDirectory(prefix="ctrace-ghidra-")
+        self.process = None
+        self.connection = None
+        self.reader = None
+        self.log = None
+        self.ready = False
+        self.replace_project = False
+        try:
+            workspace = Path(self.workspace.name)
+            endpoint = workspace / "worker.sock"
+            project = workspace / "project"
+            cached = False
+            if project_cache is not None:
+                try:
+                    marker = project_cache / "manifest.json"
+                    manifest = json.loads(marker.read_text())
+                    if (
+                        manifest.get("contract_hash") == self.contract_hash
+                        and manifest.get("identity") == project_cache.name
+                        and not project_cache.is_symlink()
+                        and not (project_cache / "project").is_symlink()
+                    ):
+                        shutil.copytree(
+                            project_cache / "project", project, symlinks=True
+                        )
+                        cached = manifest.get("files") == project_manifest(project)
+                except (OSError, ValueError, TypeError, AttributeError):
+                    pass
+            while True:
+                if not cached:
+                    shutil.rmtree(project, ignore_errors=True)
+                    project.mkdir()
+                    print(
+                        json.dumps(
+                            {
+                                "contract_hash": self.contract_hash,
+                                "progress": {
+                                    "stage": "decompile",
+                                    "module": str(self.display_path),
+                                    "detail": "Ghidra module analysis",
+                                },
+                            },
+                            separators=(",", ":"),
+                        ),
+                        flush=True,
+                    )
+                try:
+                    self.start(headless, script, project, endpoint, cached)
+                    break
+                except (OSError, ValueError, RuntimeError):
+                    self.stop(save=False)
+                    if not cached:
+                        raise
+                    # A snapshot can pass its file integrity check and still be
+                    # unusable to Ghidra. Never let that prevent fresh analysis.
+                    cached = False
+                    self.replace_project = True
+        except BaseException:
+            self.close(save=False)
+            raise
+
+    def start(self, headless, script, project, endpoint, cached):
+        workspace = Path(self.workspace.name)
+        endpoint.unlink(missing_ok=True)
+        self.log = (workspace / "ghidra.log").open("wb")
+        with socket.socket(socket.AF_UNIX) as server:
+            server.bind(str(endpoint))
+            server.listen(1)
+            environment = os.environ.copy()
+            runtime = (
+                self.project_cache.parent.parent / "ghidra-runtime"
+                if self.project_cache is not None
+                else workspace / "runtime"
+            )
+            # Ghidra also caches compiled scripts and packed databases. Keep
+            # those beneath the selected cache root; disabled caching uses only
+            # this invocation's temporary workspace, including Java preferences.
+            try:
+                runtime.mkdir(parents=True, exist_ok=True)
+                if not os.access(runtime, os.W_OK):
+                    raise PermissionError("cache root is not writable")
+            except OSError:
+                runtime = workspace / "runtime"
+            options = environment.get("JAVA_TOOL_OPTIONS", "")
+            for setting, directory in (
+                ("application.cachedir", runtime / "cache"),
+                ("application.settingsdir", runtime / "settings"),
+                ("java.util.prefs.userRoot", runtime / "preferences"),
+                ("application.tempdir", workspace / "temporary"),
+            ):
+                directory.mkdir(parents=True, exist_ok=True)
+                options += f' "-D{setting}={directory}"'
+            environment["JAVA_TOOL_OPTIONS"] = options
+            self.process = subprocess.Popen(
+                [
+                    str(headless),
+                    str(project),
+                    "ctrace",
+                    *(
+                        ["-process", "-noanalysis"]
+                        if cached
+                        else ["-import", str(self.path)]
+                    ),
+                    "-scriptPath",
+                    str(script.parent),
+                    "-postScript",
+                    script.name,
+                    str(endpoint),
+                    *(["-deleteProject"] if self.project_cache is None else []),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=self.log,
+                stderr=subprocess.STDOUT,
+                env=environment,
+            )
+            ended = os.pidfd_open(self.process.pid)
+            try:
+                ready = select.poll()
+                ready.register(server, select.POLLIN)
+                ready.register(ended, select.POLLIN)
+                while self.connection is None:
+                    if self.process.poll() is not None:
+                        detail = (workspace / "ghidra.log").read_text(errors="replace")
+                        error = (
+                            ModuleInitializationError
+                            if self.process.returncode
+                            else RuntimeError
+                        )
+                        raise error(
+                            "Ghidra could not import or analyze the module: "
+                            + detail[-3000:].strip()
+                        )
+                    for descriptor, events in ready.poll():
+                        if descriptor == server.fileno():
+                            if not events & select.POLLIN:
+                                raise RuntimeError("Ghidra listener failed")
+                            self.connection, _ = server.accept()
+                            break
+            finally:
+                os.close(ended)
+        self.connection.setblocking(True)
+        self.reader = self.connection.makefile("rb")
+        if not read_response(self.reader).get("ready"):
+            raise RuntimeError("Ghidra did not initialize the decompiler")
+        self.ready = True
+
+    def query(self, request):
+        self.connection.sendall(json.dumps(request).encode() + b"\n")
+        while True:
+            response = read_response(self.reader)
+            progress = response.get("progress")
+            if progress is None:
+                return response
+            if not isinstance(progress, dict):
+                raise RuntimeError("Ghidra returned an invalid progress notification")
+            progress["module"] = str(self.display_path)
+            response["contract_hash"] = self.contract_hash
+            print(json.dumps(response, separators=(",", ":")), flush=True)
+
+    def stop(self, save=True):
+        if save and self.connection is not None:
+            try:
+                self.connection.sendall(b'{"command":"quit"}\n')
+            except OSError:
+                pass
+        if self.reader is not None:
+            self.reader.close()
+            self.reader = None
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+        if self.process is not None:
+            saved = False
+            if save and self.ready:
+                saved = self.process.wait() == 0
+            else:
+                stop_process(self.process)
+            self.process = None
+            if saved and self.ready and self.project_cache is not None:
+                self.save_project()
+        if self.log is not None:
+            self.log.close()
+            self.log = None
+        self.ready = False
+
+    def close(self, save=True):
+        self.stop(save=save)
+        self.workspace.cleanup()
+
+    def save_project(self):
+        project = Path(self.workspace.name) / "project"
+        try:
+            files = project_manifest(project)
+            parent = self.project_cache.parent
+            parent.mkdir(parents=True, exist_ok=True)
+            # Each JVM uses a private project; only immutable snapshots are
+            # shared. Serialize publication so simultaneous tracers cannot
+            # replace a valid snapshot with an incomplete one.
+            with (parent / f".{self.project_cache.name}.lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                if self.project_cache.exists():
+                    try:
+                        marker = self.project_cache / "manifest.json"
+                        manifest = json.loads(marker.read_text())
+                        if (
+                            not self.replace_project
+                            and manifest.get("contract_hash") == self.contract_hash
+                            and manifest.get("identity") == self.project_cache.name
+                            and manifest.get("files")
+                            == project_manifest(self.project_cache / "project")
+                        ):
+                            return
+                    except (OSError, ValueError, TypeError, AttributeError):
+                        pass
+                    if self.project_cache.is_symlink():
+                        self.project_cache.unlink()
+                    elif self.project_cache.is_dir():
+                        shutil.rmtree(self.project_cache)
+                    else:
+                        self.project_cache.unlink()
+                with tempfile.TemporaryDirectory(
+                    prefix=".project-", dir=parent
+                ) as staging:
+                    snapshot = Path(staging) / "snapshot"
+                    shutil.copytree(project, snapshot / "project")
+                    manifest = {
+                        "contract_hash": self.contract_hash,
+                        "identity": self.project_cache.name,
+                        "files": files,
+                    }
+                    (snapshot / "manifest.json").write_text(
+                        json.dumps(manifest, separators=(",", ":"))
+                    )
+                    snapshot.rename(self.project_cache)
+        except (OSError, ValueError):
+            pass
+
+
+class Worker:
+    def __init__(self, headless, script, version):
+        self.headless, self.script, self.version = headless, script, version
+        artifact = Path(__file__).resolve().with_name("ctrace_contract.json")
+        try:
+            contract = json.loads(artifact.read_text())
+            self.contract_hash = contract["contract_hash"]
+            if (
+                not isinstance(self.contract_hash, str)
+                or len(self.contract_hash) != 64
+                or any(ch not in "0123456789abcdef" for ch in self.contract_hash)
+                or contract.get("python_sha256")
+                != hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+                or contract.get("java_sha256")
+                != hashlib.sha256(script.read_bytes()).hexdigest()
+            ):
+                raise ValueError("artifact hashes differ")
+        except (OSError, KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                "decompiler contract does not match this installation"
+            ) from error
+        self.modules = collections.OrderedDict()
+        self.identities = {}
+        self.responses = {}
+        self.recent_responses = collections.OrderedDict()
+        self.response_bytes = 0
+        self.indices = collections.OrderedDict()
+        self.image_manifests = collections.OrderedDict()
+        self.statistics = {
+            "prepared_hits": 0,
+            "display_loads": 0,
+            "observation_loads": 0,
+            "engine_calls": 0,
+            "engine_reuses": 0,
+            "module_imports": 0,
+        }
+        cache = os.environ.get("CTRACE_CACHE_DIR")
+        if cache is None:
+            directory = os.environ.get("XDG_CACHE_HOME")
+            base = (
+                Path(directory)
+                if directory and Path(directory).is_absolute()
+                else Path.home() / ".cache"
+            )
+            cache = str(base / "ctrace")
+        self.cache = Path(cache).expanduser().resolve() / "decompile" if cache else None
+        self.project_cache = (
+            Path(cache).expanduser().resolve() / "ghidra" if cache else None
+        )
+        self.backend_id = None
+
+    def backend_identity(self, module):
+        if self.backend_id is not None:
+            return self.backend_id
+        root = self.headless.resolve().parent.parent
+        architecture = platform.machine().lower()
+        if architecture in ("amd64", "x86_64"):
+            architecture = "x86_64"
+        native = f"{platform.system().lower()}_{architecture}"
+        artifacts = set()
+        for path in (root / "Ghidra").rglob("*"):
+            if not path.is_file():
+                continue
+            parts = path.relative_to(root).parts
+            # Runtime jars include loader/analysis extensions. Data archives,
+            # compiler/language specs and the active native tools all affect
+            # recovered names and types. Source/docs and other ISA specs do not.
+            if (
+                path.suffix == ".jar"
+                or native in parts
+                or ("data" in parts and ("Processors" not in parts or "x86" in parts))
+                or path.name
+                in ("Module.manifest", "application.properties", "extension.properties")
+            ):
+                artifacts.add(path)
+        for name in (
+            "analyzeHeadless",
+            "LaunchSupport.jar",
+            "launch.sh",
+            "launch.properties",
+        ):
+            path = root / "support" / name
+            if path.is_file():
+                artifacts.add(path)
+        ordered = sorted(artifacts, key=lambda path: path.relative_to(root).as_posix())
+        if not ordered:
+            raise RuntimeError("Ghidra engine artifacts were not found")
+        snapshot = {}
+        for path in ordered:
+            stat = path.stat()
+            snapshot[path.relative_to(root).as_posix()] = [
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_size,
+                stat.st_mtime_ns,
+                stat.st_ctime_ns,
+            ]
+        manifest_path = None
+        stored = {}
+        if self.cache is not None:
+            name = hashlib.sha256(os.fsencode(root)).hexdigest()
+            manifest_path = self.cache.parent / "engines" / f"ghidra-{name}.json"
+            try:
+                with manifest_path.open("rb") as source:
+                    encoded = source.read()
+                envelope = json.loads(encoded)
+                data = envelope["data"]
+                checksum = hashlib.sha256(
+                    json.dumps(data, separators=(",", ":"), sort_keys=True).encode()
+                ).hexdigest()
+                if (
+                    envelope.get("sha256") == checksum
+                    and data.get("contract_hash") == self.contract_hash
+                ):
+                    stored = data.get("files", {})
+            except (OSError, KeyError, ValueError, TypeError, AttributeError):
+                pass
+        current = {}
+        notified = False
+        engine = hashlib.sha256()
+        for path in ordered:
+            name = path.relative_to(root).as_posix()
+            previous = stored.get(name) if isinstance(stored, dict) else None
+            digest = previous.get("sha256") if isinstance(previous, dict) else None
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(ch not in "0123456789abcdef" for ch in digest)
+                or previous.get("stat") != snapshot[name]
+            ):
+                if not notified:
+                    print(
+                        json.dumps(
+                            {
+                                "contract_hash": self.contract_hash,
+                                "progress": {
+                                    "stage": "decompile",
+                                    "module": str(module),
+                                    "detail": "validating Ghidra engine artifacts",
+                                },
+                            },
+                            separators=(",", ":"),
+                        ),
+                        flush=True,
+                    )
+                    notified = True
+                content = hashlib.sha256()
+                with path.open("rb") as source:
+                    for block in iter(lambda: source.read(1024 * 1024), b""):
+                        content.update(block)
+                digest = content.hexdigest()
+                stat = path.stat()
+                if [
+                    stat.st_dev,
+                    stat.st_ino,
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                    stat.st_ctime_ns,
+                ] != snapshot[name]:
+                    raise RuntimeError(
+                        "Ghidra engine artifacts changed during validation"
+                    )
+            current[name] = {"stat": snapshot[name], "sha256": digest}
+            encoded_name = name.encode()
+            engine.update(len(encoded_name).to_bytes(8, "little"))
+            engine.update(encoded_name)
+            engine.update(bytes.fromhex(digest))
+        if manifest_path is not None and current != stored:
+            temporary = None
+            try:
+                manifest_path.parent.mkdir(parents=True, exist_ok=True)
+                data = {"contract_hash": self.contract_hash, "files": current}
+                digest = hashlib.sha256(
+                    json.dumps(data, separators=(",", ":"), sort_keys=True).encode()
+                ).hexdigest()
+                with tempfile.NamedTemporaryFile(
+                    mode="w", dir=manifest_path.parent, delete=False
+                ) as output:
+                    temporary = Path(output.name)
+                    json.dump(
+                        {"sha256": digest, "data": data},
+                        output,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                temporary.replace(manifest_path)
+            except OSError:
+                pass
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+        settings = {
+            name: os.environ.get(name, "")
+            for name in (
+                "JAVA_TOOL_OPTIONS",
+                "_JAVA_OPTIONS",
+                "JDK_JAVA_OPTIONS",
+                "JAVA_HOME",
+                "GHIDRA_HEADLESS_MAXMEM",
+                "LANG",
+                "LC_ALL",
+                "LC_CTYPE",
+            )
+        }
+        settings.update(
+            {
+                "platform": native,
+                "version": self.version,
+                "contract_hash": self.contract_hash,
+            }
+        )
+        content = hashlib.sha256()
+        for data in (
+            engine.digest(),
+            self.script.read_bytes(),
+            Path(__file__).read_bytes(),
+            json.dumps(settings, separators=(",", ":"), sort_keys=True).encode(),
+        ):
+            content.update(len(data).to_bytes(8, "little"))
+            content.update(data)
+        self.backend_id = content.hexdigest()
+        return self.backend_id
+
+    def read_object(self, key):
+        if (
+            self.cache is None
+            or not isinstance(key, str)
+            or len(key) != 64
+            or any(ch not in "0123456789abcdef" for ch in key)
+        ):
+            return None
+        try:
+            with (self.cache / "objects" / f"{key}.json").open("rb") as source:
+                encoded = source.read()
+            if encoded.startswith(b"\x1f\x8b"):
+                inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                encoded = inflater.decompress(encoded)
+                if not inflater.eof or inflater.unused_data or inflater.unconsumed_tail:
+                    return None
+            if hashlib.sha256(encoded).hexdigest() != key:
+                return None
+            value = json.loads(encoded)
+            return value if isinstance(value, dict) else None
+        except (OSError, ValueError, TypeError, zlib.error):
+            return None
+
+    def read_index(self, identity):
+        if self.cache is None:
+            return {}
+        try:
+            with (self.cache / identity / "index.json").open("rb") as source:
+                encoded = source.read()
+            index = json.loads(encoded)
+            if (
+                index.get("contract_hash") != self.contract_hash
+                or index.get("identity") != identity
+            ):
+                return {}
+            entries = index.get("functions")
+            return entries if isinstance(entries, dict) else {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            return {}
+
+    def remember_index(self, identity, entries):
+        self.indices[identity] = entries
+        self.indices.move_to_end(identity)
+        while len(self.indices) > MAX_MODULES:
+            self.indices.popitem(last=False)
+
+    def contains(self, response, address):
+        try:
+            ranges = response.get("ranges", [])
+            entry, end = int(response["entry"], 16), int(response["end"], 16)
+            if not isinstance(ranges, list):
+                return False
+            intervals = [
+                (int(part["start"], 16), int(part["end"], 16)) for part in ranges
+            ]
+            # A compiler's cold partition can precede its actual entry point.
+            # Membership comes from the verified ranges, not [entry, end).
+            return (
+                response.get("ok") is True
+                and response.get("contract_hash") == self.contract_hash
+                and 0 <= entry < end < 1 << 64
+                and all(0 <= start < stop <= end for start, stop in intervals)
+                and any(start <= entry < stop for start, stop in intervals)
+                and any(start <= address < stop for start, stop in intervals)
+            )
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return False
+
+    def store_response(self, identity, response):
+        if self.cache is None:
+            return
+        common = {
+            name: value
+            for name, value in response.items()
+            if name not in ("variables", "types", "level", "analysis_reused")
+        }
+        directory = self.cache / identity
+        objects = self.cache / "objects"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            objects.mkdir(parents=True, exist_ok=True)
+            published = []
+            values = [common]
+            if response["level"] == "full":
+                values.append(
+                    {
+                        "variables": response.get("variables", []),
+                        "types": response.get("types", []),
+                    }
+                )
+            for value in values:
+                if published:
+                    value = dict(value, common=published[0])
+                encoded = json.dumps(
+                    value, separators=(",", ":"), sort_keys=True
+                ).encode()
+                key = hashlib.sha256(encoded).hexdigest()
+                if len(encoded) >= COMPRESS_OBJECT_MINIMUM:
+                    compressed = gzip.compress(encoded, compresslevel=1, mtime=0)
+                    if len(compressed) < len(encoded):
+                        encoded = compressed
+                target = objects / f"{key}.json"
+                temporary = None
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        mode="wb", dir=objects, delete=False
+                    ) as output:
+                        temporary = Path(output.name)
+                        output.write(encoded)
+                    temporary.replace(target)
+                finally:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+                published.append(key)
+            entry = f"{int(common['entry'], 16):x}"
+            with (directory / "index.lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                entries = self.read_index(identity)
+                previous = entries.get(entry, {})
+                manifest = {
+                    "entry": common["entry"],
+                    "end": common["end"],
+                    "ranges": common["ranges"],
+                    "common": published[0],
+                }
+                if len(published) == 2:
+                    manifest["full"] = published[1]
+                elif (
+                    isinstance(previous, dict)
+                    and previous.get("common") == published[0]
+                    and "full" in previous
+                ):
+                    manifest["full"] = previous["full"]
+                entries[entry] = manifest
+                encoded = {
+                    "contract_hash": self.contract_hash,
+                    "identity": identity,
+                    "functions": entries,
+                }
+                temporary = None
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        mode="w", dir=directory, delete=False
+                    ) as output:
+                        temporary = Path(output.name)
+                        json.dump(
+                            encoded, output, separators=(",", ":"), sort_keys=True
+                        )
+                    temporary.replace(directory / "index.json")
+                finally:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+                self.remember_index(identity, entries)
+        except (OSError, ValueError, TypeError, KeyError):
+            # A disk cache failure never invalidates the verified live result.
+            pass
+
+    def engine_query(self, identity, path, display_path, request):
+        if identity not in self.modules:
+            while len(self.modules) >= MAX_MODULES:
+                oldest = next(iter(self.modules))
+                self.modules[oldest].close()
+                del self.modules[oldest]
+            self.modules[identity] = Module(
+                path,
+                self.headless,
+                self.script,
+                self.contract_hash,
+                (
+                    self.project_cache / identity
+                    if self.project_cache is not None
+                    else None
+                ),
+                display_path,
+            )
+            self.statistics["module_imports"] += 1
+        self.modules.move_to_end(identity)
+        module = self.modules[identity]
+        try:
+            return dict(module.query(request), contract_hash=self.contract_hash)
+        except (OSError, ValueError, RuntimeError):
+            module.close(save=False)
+            del self.modules[identity]
+            raise
+
+    def image_manifest(self, identity, path, display_path):
+        response = self.image_manifests.get(identity)
+        provenance = "prepared"
+        marker = (
+            self.cache / identity / "image.json" if self.cache is not None else None
+        )
+        if response is None and marker is not None:
+            try:
+                with marker.open("rb") as source:
+                    encoded = source.read()
+                envelope = json.loads(encoded)
+                value = envelope["manifest"]
+                content = json.dumps(
+                    value, separators=(",", ":"), sort_keys=True
+                ).encode()
+                if (
+                    envelope.get("contract_hash") == self.contract_hash
+                    and envelope.get("identity") == identity
+                    and envelope.get("sha256") == hashlib.sha256(content).hexdigest()
+                    and isinstance(value, dict)
+                    and value.get("contract_hash") == self.contract_hash
+                    and value.get("ok") is True
+                ):
+                    response, provenance = value, "disk"
+            except (OSError, ValueError, TypeError, KeyError, AttributeError):
+                pass
+        if response is None:
+            response = self.engine_query(
+                identity, path, display_path, {"command": "image_manifest"}
+            )
+            provenance = "engine"
+            if response.get("ok") and marker is not None:
+                temporary = None
+                try:
+                    content = json.dumps(
+                        response, separators=(",", ":"), sort_keys=True
+                    ).encode()
+                    envelope = {
+                        "contract_hash": self.contract_hash,
+                        "identity": identity,
+                        "sha256": hashlib.sha256(content).hexdigest(),
+                        "manifest": response,
+                    }
+                    encoded = json.dumps(
+                        envelope, separators=(",", ":"), sort_keys=True
+                    ).encode()
+                    marker.parent.mkdir(parents=True, exist_ok=True)
+                    with tempfile.NamedTemporaryFile(
+                        mode="wb", dir=marker.parent, delete=False
+                    ) as output:
+                        temporary = Path(output.name)
+                        output.write(encoded)
+                    temporary.replace(marker)
+                except (OSError, ValueError, TypeError):
+                    pass
+                finally:
+                    if temporary is not None:
+                        try:
+                            temporary.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+        if response.get("ok"):
+            self.image_manifests[identity] = response
+            self.image_manifests.move_to_end(identity)
+            while len(self.image_manifests) > MAX_MODULES:
+                self.image_manifests.popitem(last=False)
+        return dict(
+            response,
+            identity=identity,
+            provenance=provenance,
+            statistics=dict(self.statistics),
+        )
+
+    def query(self, request):
+        if request.get("contract_hash") != self.contract_hash:
+            raise ValueError("decompiler contract hash mismatch")
+        if request.get("command") == "statistics":
+            return {
+                "ok": True,
+                "contract_hash": self.contract_hash,
+                "statistics": dict(self.statistics),
+            }
+        level = request.get("level", "full")
+        if level not in ("perfetto", "full"):
+            raise ValueError("decompilation requires perfetto or full instrumentation")
+        display_path = Path(request["module"])
+        # A sealed module may exist only through a descriptor in the dedicated
+        # producer's namespace. Resolving the proc symlink would turn a valid
+        # memfd into the nonexistent '/memfd:... (deleted)' display name.
+        path = (
+            Path(request["module_file"]).absolute()
+            if "module_file" in request
+            else display_path.resolve(strict=True)
+        )
+        shared_export = request.get("shared_export", False)
+        if not isinstance(shared_export, bool):
+            raise ValueError("invalid shared decompile export mode")
+        address = int(request["address"], 16)
+        link_base = int(request["link_base"], 16)
+        if address < link_base or not path.is_file():
+            raise ValueError("invalid module address")
+        analysis_identity = request.get("analysis_identity", "")
+        if not isinstance(analysis_identity, str) or (
+            analysis_identity
+            and (
+                len(analysis_identity) != 64
+                or any(ch not in "0123456789abcdef" for ch in analysis_identity)
+            )
+        ):
+            raise ValueError("invalid module/debug analysis identity")
+        backend_id = self.backend_identity(display_path)
+        stat = path.stat()
+        identity_key = (
+            str(path),
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+            link_base,
+            analysis_identity,
+        )
+        if identity_key not in self.identities:
+            digest = hashlib.sha256()
+            digest.update(backend_id.encode())
+            digest.update(str(link_base).encode())
+            digest.update(analysis_identity.encode())
+            with path.open("rb") as source:
+                for block in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(block)
+            self.identities[identity_key] = digest.hexdigest()
+        identity = self.identities[identity_key]
+        if request.get("command") == "identity":
+            # Restore a surviving shared view before loading JSON or starting
+            # any Ghidra module/JVM. Only engine/configuration and file hashes
+            # participate in this request.
+            return {
+                "ok": True,
+                "contract_hash": self.contract_hash,
+                "identity": identity,
+            }
+        if request.get("command") == "image_manifest":
+            return self.image_manifest(identity, path, display_path)
+        prepared = (
+            self.responses.get(identity, {})
+            if shared_export
+            else self.responses.setdefault(identity, {})
+        )
+        for response in prepared.values():
+            if self.contains(response, address) and (
+                response["level"] == "full" or level == "perfetto"
+            ):
+                self.statistics["prepared_hits"] += 1
+                self.recent_responses.move_to_end(
+                    (identity, f"{int(response['entry'], 16):x}")
+                )
+                return dict(
+                    response,
+                    identity=identity,
+                    provenance="prepared",
+                    statistics=dict(self.statistics),
+                )
+        if identity not in self.indices:
+            # Keep only recent module indices; large catalogs must not remain
+            # after their engine and prepared function results are evicted.
+            self.remember_index(identity, self.read_index(identity))
+        else:
+            self.indices.move_to_end(identity)
+        for entry, manifest in self.indices[identity].items():
+            if not isinstance(manifest, dict) or not self.contains(
+                dict(manifest, ok=True, contract_hash=self.contract_hash), address
+            ):
+                continue
+            common = prepared.get(entry)
+            reused_display = common is not None
+            if reused_display:
+                common = {
+                    name: value
+                    for name, value in common.items()
+                    if name not in ("variables", "types", "level")
+                }
+                encoded = json.dumps(
+                    common, separators=(",", ":"), sort_keys=True
+                ).encode()
+                if hashlib.sha256(encoded).hexdigest() != manifest.get("common"):
+                    common = None
+                    reused_display = False
+            if common is None:
+                common = self.read_object(manifest.get("common"))
+            if (
+                common is None
+                or not self.contains(common, address)
+                or f"{int(common['entry'], 16):x}" != entry
+            ):
+                continue
+            if not reused_display:
+                self.statistics["display_loads"] += 1
+            if level == "full":
+                extra = self.read_object(manifest.get("full"))
+                if (
+                    extra is None
+                    or extra.get("common") != manifest.get("common")
+                    or not isinstance(extra.get("variables"), list)
+                    or not isinstance(extra.get("types"), list)
+                ):
+                    continue
+                self.statistics["observation_loads"] += 1
+                common.update(
+                    {name: value for name, value in extra.items() if name != "common"}
+                )
+            common["level"] = level
+            if not shared_export:
+                self.remember(identity, entry, common)
+            return dict(
+                common,
+                identity=identity,
+                provenance="disk",
+                statistics=dict(self.statistics),
+            )
+        response = self.engine_query(
+            identity,
+            path,
+            display_path,
+            {"address": hex(address), "link_base": hex(link_base), "level": level},
+        )
+        if "analysis_reused" in response:
+            counter = (
+                "engine_reuses" if response.pop("analysis_reused") else "engine_calls"
+            )
+            self.statistics[counter] += 1
+        if response.get("ok"):
+            response["level"] = level
+            if not shared_export:
+                self.remember(identity, f"{int(response['entry'], 16):x}", response)
+            self.store_response(identity, response)
+        return dict(
+            response,
+            identity=identity,
+            provenance="engine",
+            statistics=dict(self.statistics),
+        )
+
+    def remember(self, identity, entry, response):
+        key = (identity, entry)
+        self.response_bytes -= self.recent_responses.pop(key, 0)
+        self.responses.setdefault(identity, {}).pop(entry, None)
+        size = len(json.dumps(response, separators=(",", ":")).encode())
+        # The shared producer keeps no JSON objects. Direct backend users retain
+        # a bounded recent table; the byte bound limits serialized payload and
+        # the independent count bound also limits Python container overhead.
+        if size > MAX_PREPARED_BYTES:
+            return
+        while self.recent_responses and (
+            len(self.recent_responses) >= MAX_PREPARED_FUNCTIONS
+            or self.response_bytes + size > MAX_PREPARED_BYTES
+        ):
+            (old_identity, old_entry), old_size = self.recent_responses.popitem(
+                last=False
+            )
+            self.response_bytes -= old_size
+            records = self.responses[old_identity]
+            del records[old_entry]
+            if not records:
+                del self.responses[old_identity]
+        self.responses.setdefault(identity, {})[entry] = response
+        self.recent_responses[key] = size
+        self.response_bytes += size
+
+    def close(self, save=True):
+        while self.modules:
+            identity = next(reversed(self.modules))
+            self.modules[identity].close(save=save)
+            del self.modules[identity]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--check", action="store_true", help="Check Ghidra and Java availability"
+    )
+    arguments = parser.parse_args()
+    try:
+        headless, script, version = installation()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f"ctrace_decompile: {error}", file=sys.stderr)
+        return 1
+    if arguments.check:
+        print(json.dumps({"ok": True, "version": version, "headless": str(headless)}))
+        return 0
+    try:
+        worker = Worker(headless, script, version)
+    except RuntimeError as error:
+        print(f"ctrace_decompile: {error}", file=sys.stderr)
+        return 1
+    cancelled = False
+    atexit.register(lambda: worker.close(save=not cancelled))
+
+    def terminate(signum, _frame):
+        nonlocal cancelled
+        if not cancelled:
+            cancelled = True
+            raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, terminate)
+    signal.signal(signal.SIGINT, terminate)
+    # A killed shared producer must not leave its Python/JVM process group
+    # resident while another producer takes over. The signal runs close(), so
+    # even the Ghidra children outside the broker's process group are stopped.
+    parent = os.getppid()
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "cannot monitor decompiler producer")
+    if os.getppid() != parent:
+        return 1
+    try:
+        for line in sys.stdin.buffer:
+            try:
+                request = json.loads(line)
+                response = worker.query(request)
+            except (
+                OSError,
+                KeyError,
+                TypeError,
+                ValueError,
+                RuntimeError,
+                subprocess.SubprocessError,
+            ) as error:
+                response = {
+                    "ok": False,
+                    "contract_hash": worker.contract_hash,
+                    "error": str(error),
+                    "transient": not isinstance(error, ModuleInitializationError)
+                    and isinstance(
+                        error, (OSError, RuntimeError, subprocess.SubprocessError)
+                    ),
+                }
+                if isinstance(error, ModuleInitializationError):
+                    response["scope"] = "module"
+            print(json.dumps(response, separators=(",", ":")), flush=True)
+    finally:
+        worker.close(save=not cancelled)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
